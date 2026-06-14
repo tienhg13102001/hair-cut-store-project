@@ -31,10 +31,7 @@ public class BranchController {
   @GetMapping
   public ResponseEntity<List<Branch>> getAll() {
     List<Branch> result = branchRepository.findAll();
-    if (result.isEmpty()) {
-      return ResponseEntity.notFound().build();
-    }
-    return ResponseEntity.status(HttpStatus.FOUND).body(result);
+    return ResponseEntity.status(HttpStatus.OK).body(result);
   }
 
   // === 2. POST /branches ===

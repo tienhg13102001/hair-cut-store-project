@@ -35,7 +35,7 @@ public class User {
     private String avatarUrl;
 
     @Column(nullable = false)
-    private boolean isGuest = false;
+    private boolean guest = false;
 
     @Column(nullable = false)
     private boolean active = true;
@@ -53,14 +53,14 @@ public class User {
     } // JPA bắt buộc có constructor rỗng
 
     public User(String email, String password, String fullName, String phone, Role role, String avatarUrl,
-            boolean isGuest, boolean active) {
+            boolean guest, boolean active) {
         this.email = email;
         this.password = password;
         this.fullName = fullName;
         this.phone = phone;
         this.role = role;
         this.avatarUrl = avatarUrl;
-        this.isGuest = isGuest;
+        this.guest = guest;
         this.active = active;
     }
 
@@ -121,11 +121,11 @@ public class User {
     }
 
     public boolean isGuest() {
-        return isGuest;
+        return guest;
     }
 
     public void setGuest(boolean guest) {
-        isGuest = guest;
+        this.guest = guest;
     }
 
     public boolean isActive() {
@@ -151,6 +151,5 @@ public class User {
     public void setUpdatedAt(OffsetDateTime updatedAt) {
         this.updatedAt = updatedAt;
     }
-
 
 }
