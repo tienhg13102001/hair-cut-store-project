@@ -59,7 +59,7 @@ public class BarberProfileController {
 
   @PostMapping
   public ResponseEntity<BarberProfile> createBarberProfile(
-      @RequestBody CreateBarberProfileRequest req) {
+      @Valid @RequestBody CreateBarberProfileRequest req) {
 
     // Bước 1: Lookup User
     // userRepository.findById(req.userId()) → Optional

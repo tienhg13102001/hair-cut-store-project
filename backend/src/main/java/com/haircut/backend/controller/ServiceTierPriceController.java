@@ -9,6 +9,7 @@ import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -19,7 +20,8 @@ import com.haircut.backend.entity.Service;
 import com.haircut.backend.entity.ServiceTierPrice;
 import com.haircut.backend.repository.ServiceRepository;
 import com.haircut.backend.repository.ServiceTierPriceRepository;
-import org.springframework.web.bind.annotation.PutMapping;
+
+import jakarta.validation.Valid;
 
 @RestController
 @RequestMapping("/service-tier-prices")
@@ -55,7 +57,8 @@ public class ServiceTierPriceController {
   }
 
   @PostMapping()
-  public ResponseEntity<ServiceTierPrice> createServiceTierPrice(@RequestBody CreateServiceTierPriceRequest req) {
+  public ResponseEntity<ServiceTierPrice> createServiceTierPrice(
+      @Valid @RequestBody CreateServiceTierPriceRequest req) {
     Optional<Service> service = serviceRepository.findById(req.serviceId());
     if (service.isEmpty()) {
       return ResponseEntity.status(HttpStatus.BAD_REQUEST).build();
@@ -80,7 +83,7 @@ public class ServiceTierPriceController {
 
   @PutMapping("/{id}")
   public ResponseEntity<ServiceTierPrice> updateServiceTierPrice(@PathVariable Long id,
-      @RequestBody UpdateServiceTierPriceRequest req) {
+      @Valid @RequestBody UpdateServiceTierPriceRequest req) {
     Optional<ServiceTierPrice> result = serviceTierPriceRepository.findById(id);
 
     if (result.isEmpty()) {
