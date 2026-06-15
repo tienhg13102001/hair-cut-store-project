@@ -45,24 +45,59 @@ public class Service {
   }
 
   // === Getters & Setters ===
-  public Long getId() { return id; }
-  public void setId(Long id) { this.id = id; }
+  public Long getId() {
+    return id;
+  }
 
-  public String getName() { return name; }
-  public void setName(String name) { this.name = name; }
+  public void setId(Long id) {
+    this.id = id;
+  }
 
-  public String getDescription() { return description; }
-  public void setDescription(String description) { this.description = description; }
+  public String getName() {
+    return name;
+  }
 
-  public int getDurationMin() { return durationMin; }
-  public void setDurationMin(int durationMin) { this.durationMin = durationMin; }
+  public void setName(String name) {
+    this.name = name;
+  }
 
-  public boolean isActive() { return active; }
-  public void setActive(boolean active) { this.active = active; }
+  public String getDescription() {
+    return description;
+  }
 
-  public OffsetDateTime getCreatedAt() { return createdAt; }
-  public void setCreatedAt(OffsetDateTime createdAt) { this.createdAt = createdAt; }
+  public void setDescription(String description) {
+    this.description = description;
+  }
 
-  public OffsetDateTime getUpdatedAt() { return updatedAt; }
-  public void setUpdatedAt(OffsetDateTime updatedAt) { this.updatedAt = updatedAt; }
+  public int getDurationMin() {
+    return durationMin;
+  }
+
+  public void setDurationMin(int durationMin) {
+    this.durationMin = durationMin;
+  }
+
+  public boolean isActive() {
+    return active;
+  }
+
+  public void setActive(boolean active) {
+    this.active = active;
+  }
+
+  public OffsetDateTime getCreatedAt() {
+    return createdAt;
+  }
+
+  public void setCreatedAt(OffsetDateTime createdAt) {
+    this.createdAt = createdAt;
+  }
+
+  public OffsetDateTime getUpdatedAt() {
+    return updatedAt;
+  }
+
+  public void setUpdatedAt(OffsetDateTime updatedAt) {
+    this.updatedAt = updatedAt;
+  }
 }

@@ -33,10 +33,10 @@ public class BarberProfileController {
   private final BranchRepository branchRepository;
 
   public BarberProfileController(
-      BarberProfileRepository repo,
+      BarberProfileRepository barberProfileRepository,
       UserRepository userRepository,
       BranchRepository branchRepository) {
-    this.barberProfileRepository = repo;
+    this.barberProfileRepository = barberProfileRepository;
     this.userRepository = userRepository;
     this.branchRepository = branchRepository;
   }
