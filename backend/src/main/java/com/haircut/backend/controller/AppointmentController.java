@@ -1,17 +1,27 @@
 package com.haircut.backend.controller;
 
+import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.haircut.backend.dto.CreateAppointmentRequest;
 import com.haircut.backend.dto.ErrorResponse;
+import com.haircut.backend.dto.UpdateAppointmentRequest;
+import com.haircut.backend.dto.UpdateAppointmentStatusRequest;
 import com.haircut.backend.entity.Appointment;
 import com.haircut.backend.entity.AppointmentStatus;
 import com.haircut.backend.entity.BarberProfile;
@@ -24,10 +34,6 @@ import com.haircut.backend.repository.UserRepository;
 
 import jakarta.validation.Valid;
 
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.util.StringUtils;
-
 @RestController
 @RequestMapping("/appointments")
 public class AppointmentController {
@@ -35,6 +41,37 @@ public class AppointmentController {
   private final BranchRepository branchRepo;
   private final BarberProfileRepository barberRepo;
   private final UserRepository userRepo;
+
+  // Các trạng thái KHÔNG chiếm slot lịch (lịch đã huỷ / vắng mặt).
+  // Dùng cho conflict check ở cả POST và PUT — promote lên class-level để tránh
+  // tạo lại List mỗi lần gọi (cheap nhưng cleaner) và đồng bộ 1 nguồn dữ liệu.
+  private static final List<AppointmentStatus> EXCLUDED_FROM_CONFLICT = List.of(
+      AppointmentStatus.CANCELLED,
+      AppointmentStatus.NO_SHOW);
+
+  // Các trạng thái "terminal" — không cho phép sửa nữa.
+  // Dùng cho PUT để chặn update lịch đã đóng (giữ lịch sử bất biến cho
+  // audit/invoice).
+  private static final List<AppointmentStatus> TERMINAL_STATUSES = List.of(
+      AppointmentStatus.COMPLETED,
+      AppointmentStatus.CANCELLED,
+      AppointmentStatus.NO_SHOW);
+
+  // State machine: với mỗi current status, danh sách status được phép chuyển
+  // sang.
+  // Terminal status (COMPLETED, CANCELLED, NO_SHOW) → empty set (không đi đâu
+  // nữa).
+  // getOrDefault dùng Set.of() làm fallback nếu thêm enum value mới mà quên
+  // update Map
+  // → fail-safe: reject thay vì crash.
+  private static final Map<AppointmentStatus, Set<AppointmentStatus>> ALLOWED_TRANSITIONS = Map.of(
+      AppointmentStatus.PENDING, Set.of(AppointmentStatus.CONFIRMED, AppointmentStatus.CANCELLED),
+      AppointmentStatus.CONFIRMED,
+      Set.of(AppointmentStatus.IN_PROGRESS, AppointmentStatus.CANCELLED, AppointmentStatus.NO_SHOW),
+      AppointmentStatus.IN_PROGRESS, Set.of(AppointmentStatus.COMPLETED, AppointmentStatus.CANCELLED),
+      AppointmentStatus.COMPLETED, Set.of(),
+      AppointmentStatus.CANCELLED, Set.of(),
+      AppointmentStatus.NO_SHOW, Set.of());
 
   public AppointmentController(
       AppointmentRepository appointmentRepo,
@@ -144,11 +181,8 @@ public class AppointmentController {
           "customerId"));
     }
 
-    List<AppointmentStatus> excluded = List.of(
-        AppointmentStatus.CANCELLED,
-        AppointmentStatus.NO_SHOW);
     List<Appointment> dataConflict = appointmentRepo.findConflicts(
-        barberProfile.get().getId(), body.startAt(), body.endAt(), excluded);
+        barberProfile.get().getId(), body.startAt(), body.endAt(), EXCLUDED_FROM_CONFLICT);
     if (!dataConflict.isEmpty()) {
       // Lấy lịch trùng đầu tiên để báo cho dev biết cụ thể conflict với cái nào.
       Appointment first = dataConflict.get(0);
@@ -179,4 +213,220 @@ public class AppointmentController {
     return ResponseEntity.status(HttpStatus.CREATED).body(saved);
   }
 
+  @PutMapping("/{id}")
+  public ResponseEntity<?> updateAppointment(
+      @PathVariable Long id,
+      @Valid @RequestBody UpdateAppointmentRequest req) {
+
+    // ────────────────────────────────────────────────────────────────────────
+    // [A] LOAD APPOINTMENT
+    // ────────────────────────────────────────────────────────────────────────
+    // Bắt buộc — không có entity cũ thì không có gì để merge/validate.
+    Optional<Appointment> appointmentOpt = appointmentRepo.findById(id);
+    if (appointmentOpt.isEmpty()) {
+      return ResponseEntity.status(HttpStatus.NOT_FOUND).body(ErrorResponse.of(
+          "APPOINTMENT_NOT_FOUND",
+          "Appointment id=" + id + " không tồn tại"));
+    }
+    Appointment appointment = appointmentOpt.get();
+
+    // ────────────────────────────────────────────────────────────────────────
+    // [B] TERMINAL CHECK
+    // ────────────────────────────────────────────────────────────────────────
+    // Lịch ở trạng thái COMPLETED / CANCELLED / NO_SHOW là "đã đóng" —
+    // sửa sẽ phá audit trail và có thể conflict với invoice đã in.
+    // Phải reject SỚM trước khi load thêm gì.
+    if (TERMINAL_STATUSES.contains(appointment.getStatus())) {
+      return ResponseEntity.status(HttpStatus.CONFLICT).body(ErrorResponse.of(
+          "APPOINTMENT_FINALIZED",
+          "Không thể sửa lịch đã ở trạng thái terminal: " + appointment.getStatus()));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // [C] COMPUTE NEW VALUES (merge req + entity)
+    // ────────────────────────────────────────────────────────────────────────
+    // Partial PUT: field nào req gửi null = "không đổi" → dùng giá trị cũ.
+    // Phải merge TRƯỚC khi validate, không được validate trực tiếp trên req
+    // (vì req.startAt() có thể null → NPE).
+    OffsetDateTime newStart = req.startAt() != null ? req.startAt() : appointment.getStartAt();
+    OffsetDateTime newEnd = req.endAt() != null ? req.endAt() : appointment.getEndAt();
+
+    // ────────────────────────────────────────────────────────────────────────
+    // [D] VALIDATE TIME RANGE (trên giá trị đã merge)
+    // ────────────────────────────────────────────────────────────────────────
+    // Pure CPU — không cần query — fail-fast trước khi load FK.
+    // Test ngược logic: "endAt phải sau startAt" → ĐÚNG = endAt.isAfter(startAt)
+    // → SAI (reject) = phủ định.
+    if (!newEnd.isAfter(newStart)) {
+      return ResponseEntity.badRequest().body(ErrorResponse.of(
+          "INVALID_TIME_RANGE",
+          "endAt phải sau startAt. Nhận: startAt=" + newStart + ", endAt=" + newEnd));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // [E] LOAD FK MỚI (nếu user gửi) — 404 nếu ID sai
+    // ────────────────────────────────────────────────────────────────────────
+    // Pattern bắt buộc 2 nhánh:
+    // - req.xId() == null → "không đổi" → dùng entity cũ
+    // - req.xId() != null → load DB → nếu empty → 404 (KHÔNG được silent skip)
+    // Lưu kết quả vào biến entity (newBranch/newBarber) để dùng cho [F] và [I].
+    Branch newBranch;
+    if (req.branchId() != null) {
+      Optional<Branch> branchOpt = branchRepo.findById(req.branchId());
+      if (branchOpt.isEmpty()) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(ErrorResponse.of(
+            "BRANCH_NOT_FOUND",
+            "Branch id=" + req.branchId() + " không tồn tại",
+            "branchId"));
+      }
+      newBranch = branchOpt.get();
+    } else {
+      newBranch = appointment.getBranch();
+    }
+
+    BarberProfile newBarber;
+    if (req.barberId() != null) {
+      Optional<BarberProfile> barberOpt = barberRepo.findById(req.barberId());
+      if (barberOpt.isEmpty()) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(ErrorResponse.of(
+            "BARBER_NOT_FOUND",
+            "BarberProfile id=" + req.barberId() + " không tồn tại",
+            "barberId"));
+      }
+      newBarber = barberOpt.get();
+    } else {
+      newBarber = appointment.getBarber();
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // [F] BARBER-IN-BRANCH RE-CHECK
+    // ────────────────────────────────────────────────────────────────────────
+    // Tránh case: user đổi branch sang Hà Nội nhưng giữ thợ ở Sài Gòn.
+    // Dùng equals() chứ KHÔNG dùng == (Long boxed, value >127 sẽ fail random).
+    Long newBarberBranchId = newBarber.getBranch().getId();
+    Long targetBranchId = newBranch.getId();
+    if (!newBarberBranchId.equals(targetBranchId)) {
+      return ResponseEntity.badRequest().body(ErrorResponse.of(
+          "BARBER_NOT_IN_BRANCH",
+          "Barber id=" + newBarber.getId() + " thuộc branch id=" + newBarberBranchId
+              + ", không khớp branch yêu cầu id=" + targetBranchId,
+          "barberId"));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // [G] WALK-IN UPDATE GUARD
+    // ────────────────────────────────────────────────────────────────────────
+    // XOR rule (đã enforce ở POST): 1 lịch hoặc thuộc customer hoặc walk-in,
+    // không bao giờ cả 2. PUT phải giữ invariant này.
+    // Nếu lịch đã có customer mà user cố set walk-in info → reject.
+    boolean wantsWalkInUpdate = req.walkInName() != null || req.walkInPhone() != null;
+    if (wantsWalkInUpdate && appointment.getCustomer() != null) {
+      return ResponseEntity.badRequest().body(ErrorResponse.of(
+          "INVALID_WALKIN_UPDATE",
+          "Không thể đặt walk-in info cho lịch khách đã đăng ký (customerId="
+              + appointment.getCustomer().getId() + ")"));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // [H] CONFLICT CHECK (đắt nhất — đặt cuối + SKIP optimize)
+    // ────────────────────────────────────────────────────────────────────────
+    // Nếu user không đổi giờ + không đổi thợ → slot không thay đổi → đã pass
+    // ở POST hoặc PUT trước → KHÔNG cần query lại. Tiết kiệm 1 round-trip DB.
+    boolean slotChanged = req.startAt() != null
+        || req.endAt() != null
+        || req.barberId() != null;
+    if (slotChanged) {
+      // Dùng findConflictsExcluding (loại trừ chính lịch đang update) — nếu
+      // không, lịch sẽ "tự conflict với chính nó" khi shrink/đổi giờ nhỏ.
+      // Dùng newStart/newEnd/newBarber.getId() (đã merge), KHÔNG dùng raw req.
+      List<Appointment> conflicts = appointmentRepo.findConflictsExcluding(
+          newBarber.getId(), id, newStart, newEnd, EXCLUDED_FROM_CONFLICT);
+      if (!conflicts.isEmpty()) {
+        Appointment first = conflicts.get(0);
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(ErrorResponse.of(
+            "TIME_CONFLICT",
+            String.format(
+                "Thợ id=%d đã có %d lịch trùng. VD: appointmentId=%d (%s → %s, status=%s)",
+                newBarber.getId(),
+                conflicts.size(),
+                first.getId(),
+                first.getStartAt(),
+                first.getEndAt(),
+                first.getStatus())));
+      }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // [I] APPLY CHANGES (chỉ field non-null)
+    // ────────────────────────────────────────────────────────────────────────
+    // Quan trọng: phải guard `if (req.xxx() != null)` cho TỪNG field, kể cả
+    // FK đã load ở [E]. Lý do: nếu req.branchId() null thì newBranch =
+    // appointment.getBranch() (cùng object) → setBranch lại là no-op nhưng
+    // KHÔNG sai. Tuy nhiên giữ guard cho consistency + dễ đọc intent.
+    if (req.branchId() != null)
+      appointment.setBranch(newBranch);
+    if (req.barberId() != null)
+      appointment.setBarber(newBarber);
+    if (req.startAt() != null)
+      appointment.setStartAt(req.startAt());
+    if (req.endAt() != null)
+      appointment.setEndAt(req.endAt());
+    if (req.walkInName() != null)
+      appointment.setWalkInName(req.walkInName());
+    if (req.walkInPhone() != null)
+      appointment.setWalkInPhone(req.walkInPhone());
+    if (req.note() != null)
+      appointment.setNote(req.note());
+
+    // ────────────────────────────────────────────────────────────────────────
+    // [J] SAVE
+    // ────────────────────────────────────────────────────────────────────────
+    // JPA tự detect field đã đổi (dirty checking) và sinh UPDATE SQL minimal.
+    // @UpdateTimestamp trên `updatedAt` cũng tự bump.
+    Appointment saved = appointmentRepo.save(appointment);
+    return ResponseEntity.ok(saved);
+  }
+
+  @PatchMapping("/{id}/status")
+  public ResponseEntity<?> updateAppointmentStatus(@PathVariable Long id,
+      @Valid @RequestBody UpdateAppointmentStatusRequest req) {
+
+    // [A] Load — 404 APPOINTMENT_NOT_FOUND nếu rỗng
+    Optional<Appointment> appointmentOpt = appointmentRepo.findById(id);
+    if (appointmentOpt.isEmpty()) {
+      return ResponseEntity.status(HttpStatus.NOT_FOUND).body(ErrorResponse.of(
+          "APPOINTMENT_NOT_FOUND",
+          "Appointment id=" + id + " không tồn tại"));
+    }
+    Appointment appointment = appointmentOpt.get();
+
+    // [B] Lấy currentStatus = appointment.getStatus()
+    // Nếu currentStatus == req.status() → idempotent, có thể return 200 luôn
+    // Hoặc reject là INVALID_STATUS_TRANSITION (tùy bạn chọn — recommend:
+    // idempotent OK)
+    if (TERMINAL_STATUSES.contains(appointment.getStatus())) {
+      return ResponseEntity.status(HttpStatus.CONFLICT).body(ErrorResponse.of(
+          "APPOINTMENT_FINALIZED",
+          "Không thể sửa lịch đã ở trạng thái terminal: " + appointment.getStatus()));
+    }
+
+    // [C] Check allowed transition:
+    // Cách 1 (gọn): switch (currentStatus) → trả về Set<AppointmentStatus> allowed
+    // Cách 2 (sạch): Map<AppointmentStatus, Set<AppointmentStatus>> TRANSITIONS
+    // class-level
+    // Nếu req.status() KHÔNG nằm trong allowed → 409 INVALID_STATUS_TRANSITION
+    // Message: "Không thể chuyển từ X sang Y"
+    AppointmentStatus currentStatus = appointment.getStatus();
+    Set<AppointmentStatus> allowed = ALLOWED_TRANSITIONS.getOrDefault(currentStatus, Set.of());
+    if (!allowed.contains(req.status())) {
+      return ResponseEntity.status(HttpStatus.CONFLICT)
+          .body(ErrorResponse.of("CANT_TRANSITION_STATUS",
+              "Không thể chuyển từ " + currentStatus + " sang " + req.status()));
+    }
+
+    // [D] Apply: appointment.setStatus(req.status());
+    appointment.setStatus(req.status());
+    Appointment savedData = appointmentRepo.save(appointment);
+    return ResponseEntity.status(HttpStatus.OK).body(savedData);
+  }
 }
