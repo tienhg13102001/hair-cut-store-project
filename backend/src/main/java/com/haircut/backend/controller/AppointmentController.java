@@ -1,5 +1,6 @@
 package com.haircut.backend.controller;
 
+import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Map;
@@ -8,6 +9,7 @@ import java.util.Set;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
@@ -23,16 +25,24 @@ import com.haircut.backend.dto.ErrorResponse;
 import com.haircut.backend.dto.UpdateAppointmentRequest;
 import com.haircut.backend.dto.UpdateAppointmentStatusRequest;
 import com.haircut.backend.entity.Appointment;
+import com.haircut.backend.entity.AppointmentService;
 import com.haircut.backend.entity.AppointmentStatus;
 import com.haircut.backend.entity.BarberProfile;
 import com.haircut.backend.entity.Branch;
+import com.haircut.backend.entity.Invoice;
+import com.haircut.backend.entity.InvoiceItem;
+import com.haircut.backend.entity.InvoiceStatus;
 import com.haircut.backend.entity.User;
 import com.haircut.backend.repository.AppointmentRepository;
+import com.haircut.backend.repository.AppointmentServiceRepository;
 import com.haircut.backend.repository.BarberProfileRepository;
 import com.haircut.backend.repository.BranchRepository;
+import com.haircut.backend.repository.InvoiceItemRepository;
+import com.haircut.backend.repository.InvoiceRepository;
 import com.haircut.backend.repository.UserRepository;
 
 import jakarta.validation.Valid;
+import org.springframework.web.bind.annotation.RequestParam;
 
 @RestController
 @RequestMapping("/appointments")
@@ -41,6 +51,10 @@ public class AppointmentController {
   private final BranchRepository branchRepo;
   private final BarberProfileRepository barberRepo;
   private final UserRepository userRepo;
+  // 3 repo cho việc auto-tạo hóa đơn khi lịch COMPLETED (Bước 4)
+  private final AppointmentServiceRepository appointmentServiceRepo;
+  private final InvoiceRepository invoiceRepo;
+  private final InvoiceItemRepository invoiceItemRepo;
 
   // Các trạng thái KHÔNG chiếm slot lịch (lịch đã huỷ / vắng mặt).
   // Dùng cho conflict check ở cả POST và PUT — promote lên class-level để tránh
@@ -77,11 +91,17 @@ public class AppointmentController {
       AppointmentRepository appointmentRepo,
       BranchRepository branchRepo,
       BarberProfileRepository barberRepo,
-      UserRepository userRepo) {
+      UserRepository userRepo,
+      AppointmentServiceRepository appointmentServiceRepo,
+      InvoiceRepository invoiceRepo,
+      InvoiceItemRepository invoiceItemRepo) {
     this.appointmentRepo = appointmentRepo;
     this.branchRepo = branchRepo;
     this.barberRepo = barberRepo;
     this.userRepo = userRepo;
+    this.appointmentServiceRepo = appointmentServiceRepo;
+    this.invoiceRepo = invoiceRepo;
+    this.invoiceItemRepo = invoiceItemRepo;
   }
 
   @GetMapping()
@@ -388,6 +408,8 @@ public class AppointmentController {
   }
 
   @PatchMapping("/{id}/status")
+  @Transactional // gói toàn bộ handler trong 1 transaction: nếu tạo Invoice/Item lỗi
+                 // giữa chừng → rollback CẢ status change. Không để hóa đơn nửa vời.
   public ResponseEntity<?> updateAppointmentStatus(@PathVariable Long id,
       @Valid @RequestBody UpdateAppointmentStatusRequest req) {
 
@@ -427,6 +449,64 @@ public class AppointmentController {
     // [D] Apply: appointment.setStatus(req.status());
     appointment.setStatus(req.status());
     Appointment savedData = appointmentRepo.save(appointment);
+
+    // [E] Event-driven creation: chuyển sang COMPLETED → tự sinh hóa đơn.
+    // == so sánh enum AN TOÀN (enum là singleton, khác Long boxed ở bug cũ).
+    if (req.status() == AppointmentStatus.COMPLETED) {
+      createInvoiceForAppointment(appointment);
+    }
+
     return ResponseEntity.status(HttpStatus.OK).body(savedData);
   }
+
+  // Auto-tạo Invoice + InvoiceItem từ các AppointmentService của 1 lịch.
+  // Gọi nội bộ khi lịch chuyển COMPLETED. private vì KHÔNG phải endpoint —
+  // đây là side-effect của state transition (không có POST /invoices riêng).
+  private void createInvoiceForAppointment(Appointment appointment) {
+    // [1] Chống tạo trùng: PATCH có thể bị gọi lại, hoặc 1 lịch chỉ 1 hóa đơn
+    // (@OneToOne unique). existsBy rẻ hơn findBy + isPresent.
+    if (invoiceRepo.existsByAppointmentId(appointment.getId())) {
+      return;
+    }
+
+    // [2] Load tất cả dịch vụ đã book của lịch (nguồn để copy snapshot).
+    // Lịch không có dịch vụ nào → list rỗng → hóa đơn total = 0 (vẫn hợp lệ).
+    List<AppointmentService> bookedServices = appointmentServiceRepo.findByAppointmentId(appointment.getId());
+
+    // [3] Tạo Invoice ở trạng thái DRAFT. totalVnd tạm = 0, sẽ cộng dồn ở dưới.
+    // Phải save TRƯỚC khi tạo InvoiceItem để Invoice có id (FK invoice_id).
+    Invoice invoice = new Invoice();
+    invoice.setAppointment(appointment);
+    invoice.setStatus(InvoiceStatus.DRAFT);
+    invoice.setTotalVnd(BigDecimal.ZERO);
+    Invoice savedInvoice = invoiceRepo.save(invoice);
+
+    // [4] Aggregate: vừa tạo từng InvoiceItem (snapshot-of-snapshot),
+    // vừa cộng dồn giá vào total.
+    BigDecimal total = BigDecimal.ZERO;
+    for (AppointmentService booked : bookedServices) {
+      InvoiceItem item = new InvoiceItem(
+          savedInvoice,
+          booked.getService().getName(), // snapshot tên (LAZY load OK nhờ OSIV)
+          booked.getPriceVndAtBooking()); // snapshot giá (đã snapshot 1 lần ở booking)
+      invoiceItemRepo.save(item);
+      total = total.add(booked.getPriceVndAtBooking()); // BigDecimal bất biến → phải gán lại
+    }
+
+    // [5] Chốt total cho Invoice rồi save lần cuối.
+    savedInvoice.setTotalVnd(total);
+    invoiceRepo.save(savedInvoice);
+  }
+
+  @GetMapping("/{id}/invoice")
+  public ResponseEntity<?> getInvoiceById(@PathVariable Long id) {
+    Optional<Invoice> foundInvoiceOpt = invoiceRepo.findByAppointmentId(id);
+    if (foundInvoiceOpt.isEmpty()) {
+      return ResponseEntity.status(HttpStatus.NOT_FOUND)
+          .body(ErrorResponse.of("INVOICE_NOT_FOUND", "Lịch id=" + id + " chưa có hóa đơn"));
+    }
+    Invoice foundInvoice = foundInvoiceOpt.get();
+    return ResponseEntity.status(HttpStatus.OK).body(foundInvoice);
+  }
+
 }
