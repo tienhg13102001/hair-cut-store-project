@@ -22,6 +22,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.haircut.backend.dto.CreateAppointmentRequest;
 import com.haircut.backend.dto.ErrorResponse;
+import com.haircut.backend.dto.InvoiceResponse;
 import com.haircut.backend.dto.UpdateAppointmentRequest;
 import com.haircut.backend.dto.UpdateAppointmentStatusRequest;
 import com.haircut.backend.entity.Appointment;
@@ -506,7 +507,11 @@ public class AppointmentController {
           .body(ErrorResponse.of("INVOICE_NOT_FOUND", "Lịch id=" + id + " chưa có hóa đơn"));
     }
     Invoice foundInvoice = foundInvoiceOpt.get();
-    return ResponseEntity.status(HttpStatus.OK).body(foundInvoice);
+    // Load line items riêng (Invoice entity không map @OneToMany) rồi gói vào DTO.
+    // Trả InvoiceResponse thay vì entity → không lộ cây appointment/branch/barber,
+    // không dính rác hibernateLazyInitializer, không phụ thuộc OSIV.
+    List<InvoiceItem> items = invoiceItemRepo.findByInvoiceId(foundInvoice.getId());
+    return ResponseEntity.status(HttpStatus.OK).body(InvoiceResponse.from(foundInvoice, items));
   }
 
 }
