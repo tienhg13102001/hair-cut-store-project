@@ -12,6 +12,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.haircut.backend.dto.CreateBarberProfileRequest;
@@ -42,8 +43,10 @@ public class BarberProfileController {
   }
 
   @GetMapping()
-  public ResponseEntity<List<BarberProfile>> getAllBarberProfiles() {
-    List<BarberProfile> data = barberProfileRepository.findAll();
+  public ResponseEntity<List<BarberProfile>> getAllBarberProfiles(@RequestParam(required = false) Long branchId) {
+    List<BarberProfile> data = (branchId == null)
+        ? barberProfileRepository.findAll()
+        : barberProfileRepository.findByBranchId(branchId);
     return ResponseEntity.status(HttpStatus.OK).body(data);
   }
 
